@@ -4,8 +4,8 @@ try:
 except ImportError:
     from SPPE.src.utils.img import transformBoxInvert, transformBoxInvert_batch
 import torch
-
-
+import numpy as np
+import json
 class DataLogger(object):
     def __init__(self):
         self.clear()
@@ -110,14 +110,14 @@ def postprocess(output):
     return p
 
 
-def getPrediction(hms, pt1, pt2, inpH, inpW, resH, resW):
+def getPrediction(hms, pt1, pt2, inpH, inpW, resH, resW, im_name):
     '''
     Get keypoint location from heatmaps
     '''
-
+    #save_hmaps(hms)
     assert hms.dim() == 4, 'Score maps should be 4-dim'
     maxval, idx = torch.max(hms.view(hms.size(0), hms.size(1), -1), 2)
-
+ 
     maxval = maxval.view(hms.size(0), hms.size(1), 1)
     idx = idx.view(hms.size(0), hms.size(1), 1) + 1
 
@@ -140,12 +140,25 @@ def getPrediction(hms, pt1, pt2, inpH, inpW, resH, resW):
                 preds[i][j] += diff.sign() * 0.25
     preds += 0.2
 
+    #save_myjson(im_name,hms)
+    #get the box and image Proportion
+    R_preds = torch.zeros(preds.size())
+    R_newpoint = torch.zeros(preds.size())
+    num_people = len(R_preds)
+    Proportion_people = []
+    for i in range(num_people):
+        R_preds[i, 0, 0] = 80
+        R_preds[i, 0, 1] = 64
+    R_newpoint = transformBoxInvert_batch(R_preds, pt1, pt2, inpH, inpW, resH, resW)
+    for i in range(num_people):
+        rdlu_tuple = (float(R_newpoint[i][1][0].numpy()),float(R_newpoint[i][1][1].numpy()),float(R_newpoint[i][0][0].numpy()),float(R_newpoint[i][0][1].numpy()))
+        Proportion_people.append(rdlu_tuple)
+    save_myjson(im_name, Proportion_people, hms)
+    print('---------')
     preds_tf = torch.zeros(preds.size())
-
     preds_tf = transformBoxInvert_batch(preds, pt1, pt2, inpH, inpW, resH, resW)
 
     return preds, preds_tf, maxval
-
 
 def getPrediction_batch(hms, pt1, pt2, inpH, inpW, resH, resW):
     '''
@@ -190,8 +203,22 @@ def getPrediction_batch(hms, pt1, pt2, inpH, inpW, resH, resW):
 
     preds[:, :, 0] += diff1.squeeze(-1)
     preds[:, :, 1] += diff2.squeeze(-1)
-
     preds_tf = torch.zeros(preds.size())
-    preds_tf = transformBoxInvert_batch(preds, pt1, pt2, inpH, inpW, resH, resW)
-
+    preds_tf = transformBoxInvert_batch(preds, pt1, pt2, inpH, inpW, resH, resW)  
     return preds, preds_tf, maxval
+
+# save .json(Proportion_people)  and .npy(hms) files.
+def save_myjson(im_name,Proportion_people,hms):
+    '''
+        im_name : string
+        Proportion_people : List = n*tuple(width, height)
+        hms : torch.tensor
+    '''
+    print(im_name)
+   # print(Proportion_people)
+    print(json.dumps(Proportion_people,sort_keys=True, indent=4))
+    np_hms = hms.numpy()
+    np.save("out_npy/" + im_name.replace('.jpg', '') + ".npy",np_hms)
+    with open("out_npy/" + im_name.replace('.jpg', '') + ".json", "w", encoding='utf-8') as file:
+        file.write(json.dumps(Proportion_people, indent=4))
+    return
