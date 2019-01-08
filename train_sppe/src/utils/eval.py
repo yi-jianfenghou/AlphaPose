@@ -1,19 +1,11 @@
-# -----------------------------------------------------
-# Copyright (c) Shanghai Jiao Tong University. All rights reserved.
-# Written by Jiefeng Li (jeff.lee.sjtu@gmail.com)
-# -----------------------------------------------------
-
 from opt import opt
-import sys
-import numpy as np
-
+try:
+    from utils.img import transformBoxInvert, transformBoxInvert_batch
+except ImportError:
+    from SPPE.src.utils.img import transformBoxInvert, transformBoxInvert_batch
 import torch
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
-
-from utils.img import transformBoxInvert
-
-
+import numpy as np
+import json
 class DataLogger(object):
     def __init__(self):
         self.clear()
@@ -34,14 +26,9 @@ class DataLogger(object):
         self.avg = self.sum / self.cnt
 
 
-class NullWriter(object):
-    def write(self, arg):
-        pass
-
-
-def accuracy(output, label, dataset, out_offset=None):
+def accuracy(output, label, dataset):
     if type(output) == list:
-        return accuracy(output[opt.nStack - 1], label[opt.nStack - 1], dataset, out_offset)
+        return accuracy(output[opt.nStack - 1], label[opt.nStack - 1], dataset)
     else:
         return heatmapAccuracy(output.cpu().data, label.cpu().data, dataset.accIdxs)
 
@@ -52,7 +39,7 @@ def heatmapAccuracy(output, label, idxs):
 
     norm = torch.ones(preds.size(0)) * opt.outputResH / 10
     dists = calc_dists(preds, gt, norm)
-
+    #print(dists)
     acc = torch.zeros(len(idxs) + 1)
     avg_acc = 0
     cnt = 0
@@ -116,18 +103,21 @@ def postprocess(output):
             hm = output[i][j]
             pX, pY = int(round(p[i][j][0])), int(round(p[i][j][1]))
             if 0 < pX < opt.outputResW - 1 and 0 < pY < opt.outputResH - 1:
-                diff = torch.Tensor(
-                    (hm[pY][pX + 1] - hm[pY][pX - 1], hm[pY + 1][pX] - hm[pY - 1][pX]))
+                diff = torch.Tensor((hm[pY][pX + 1] - hm[pY][pX - 1], hm[pY + 1][pX] - hm[pY - 1][pX]))
                 p[i][j] += diff.sign() * 0.25
     p -= 0.5
 
     return p
 
 
-def getPrediction(hms, pt1, pt2, inpH, inpW, resH, resW):
+def getPrediction(hms, pt1, pt2, inpH, inpW, resH, resW, im_name):
+    '''
+    Get keypoint location from heatmaps
+    '''
+    #save_hmaps(hms)
     assert hms.dim() == 4, 'Score maps should be 4-dim'
     maxval, idx = torch.max(hms.view(hms.size(0), hms.size(1), -1), 2)
-
+ 
     maxval = maxval.view(hms.size(0), hms.size(1), 1)
     idx = idx.view(hms.size(0), hms.size(1), 1) + 1
 
@@ -143,66 +133,92 @@ def getPrediction(hms, pt1, pt2, inpH, inpW, resH, resW):
     for i in range(preds.size(0)):
         for j in range(preds.size(1)):
             hm = hms[i][j]
-            pX, pY = int(round(float(preds[i][j][0]))), int(
-                round(float(preds[i][j][1])))
-            if 1 < pX < opt.outputResW - 2 and 1 < pY < opt.outputResH - 2:
+            pX, pY = int(round(float(preds[i][j][0]))), int(round(float(preds[i][j][1])))
+            if 0 < pX < opt.outputResW - 1 and 0 < pY < opt.outputResH - 1:
                 diff = torch.Tensor(
                     (hm[pY][pX + 1] - hm[pY][pX - 1], hm[pY + 1][pX] - hm[pY - 1][pX]))
-                diff = diff.sign() * 0.25
-                diff[1] = diff[1] * inpH / inpW
-                preds[i][j] += diff
+                preds[i][j] += diff.sign() * 0.25
+    preds += 0.2
 
+    #save_myjson(im_name,hms)
+    #get the box and image Proportion
+    R_preds = torch.zeros(preds.size())
+    R_newpoint = torch.zeros(preds.size())
+    num_people = len(R_preds)
+    Proportion_people = []
+    for i in range(num_people):
+        R_preds[i, 0, 0] = 80
+        R_preds[i, 0, 1] = 64
+    R_newpoint = transformBoxInvert_batch(R_preds, pt1, pt2, inpH, inpW, resH, resW)
+    for i in range(num_people):
+        rdlu_tuple = (float(R_newpoint[i][1][0].numpy()),float(R_newpoint[i][1][1].numpy()),float(R_newpoint[i][0][0].numpy()),float(R_newpoint[i][0][1].numpy()))
+        Proportion_people.append(rdlu_tuple)
+    save_myjson(im_name, Proportion_people, hms)
+    print('---------')
     preds_tf = torch.zeros(preds.size())
-    for i in range(hms.size(0)):        # Number of samples
-        for j in range(hms.size(1)):    # Number of output heatmaps for one sample
-            preds_tf[i][j] = transformBoxInvert(
-                preds[i][j], pt1[i], pt2[i], inpH, inpW, resH, resW)
+    preds_tf = transformBoxInvert_batch(preds, pt1, pt2, inpH, inpW, resH, resW)
 
     return preds, preds_tf, maxval
 
+def getPrediction_batch(hms, pt1, pt2, inpH, inpW, resH, resW):
+    '''
+    Get keypoint location from heatmaps
+    pt1, pt2:   [n, 2]
+    OUTPUT:
+        preds:  [n, 17, 2]
+    '''
 
-def getmap(JsonDir='./val/alphapose-results.json'):
-    ListDir = '../coco-minival500_images.txt'
+    assert hms.dim() == 4, 'Score maps should be 4-dim'
+    flat_hms = hms.view(hms.size(0), hms.size(1), -1)
+    maxval, idx = torch.max(flat_hms, 2)
 
-    annType = ['segm', 'bbox', 'keypoints']
-    annType = annType[2]  # specify type here
-    prefix = 'person_keypoints' if annType == 'keypoints' else 'instances'
-    print('Running evaluation for *%s* results.' % (annType))
+    maxval = maxval.view(hms.size(0), hms.size(1), 1)
+    idx = idx.view(hms.size(0), hms.size(1), 1) + 1
 
-    # load Ground_truth
-    dataType = 'val2014'
-    annFile = '../%s_%s.json' % (prefix, dataType)
-    cocoGt = COCO(annFile)
+    preds = idx.repeat(1, 1, 2).float()
 
-    # load Answer(json)
-    resFile = JsonDir
-    cocoDt = cocoGt.loadRes(resFile)
+    preds[:, :, 0] = (preds[:, :, 0] - 1) % hms.size(3)
+    preds[:, :, 1] = torch.floor((preds[:, :, 1] - 1) / hms.size(3))
 
-    # load List
-    fin = open(ListDir, 'r')
-    imgIds_str = fin.readline()
-    if imgIds_str[-1] == '\n':
-        imgIds_str = imgIds_str[:-1]
-    imgIds_str = imgIds_str.split(',')
+    pred_mask = maxval.gt(0).repeat(1, 1, 2).float()
+    preds *= pred_mask
 
-    imgIds = []
-    for x in imgIds_str:
-        imgIds.append(int(x))
+    # Very simple post-processing step to improve performance at tight PCK thresholds
+    idx_up = (idx - hms.size(3)).clamp(0, flat_hms.size(2) - 1)
+    idx_down = (idx + hms.size(3)).clamp(0, flat_hms.size(2) - 1)
+    idx_left = (idx - 1).clamp(0, flat_hms.size(2) - 1)
+    idx_right = (idx + 1).clamp(0, flat_hms.size(2) - 1)
 
-    # running evaluation
-    iouThrs = np.linspace(.5, 0.95, np.round((0.95 - .5) / .05) + 1, endpoint=True)
-    t = np.where(0.5 == iouThrs)[0]
+    maxval_up = flat_hms.gather(2, idx_up)
+    maxval_down = flat_hms.gather(2, idx_down)
+    maxval_left = flat_hms.gather(2, idx_left)
+    maxval_right = flat_hms.gather(2, idx_right)
 
-    cocoEval = COCOeval(cocoGt, cocoDt, annType)
-    cocoEval.params.imgIds = imgIds
-    cocoEval.evaluate()
-    cocoEval.accumulate()
+    diff1 = (maxval_right - maxval_left).sign() * 0.25
+    diff2 = (maxval_down - maxval_up).sign() * 0.25
+    diff1[idx_up <= hms.size(3)] = 0
+    diff1[idx_down / hms.size(3) >= (hms.size(3) - 1)] = 0
+    diff2[(idx_left % hms.size(3)) == 0] = 0
+    diff2[(idx_left % hms.size(3)) == (hms.size(3) - 1)] = 0
 
-    score = cocoEval.eval['precision'][:, :, :, 0, :]
-    mApAll, mAp5 = 0.01, 0.01
-    if len(score[score > -1]) != 0:
-        score2 = score[t]
-        mApAll = np.mean(score[score > -1])
-        mAp5 = np.mean(score2[score2 > -1])
-    cocoEval.summarize()
-    return mApAll, mAp5
+    preds[:, :, 0] += diff1.squeeze(-1)
+    preds[:, :, 1] += diff2.squeeze(-1)
+    preds_tf = torch.zeros(preds.size())
+    preds_tf = transformBoxInvert_batch(preds, pt1, pt2, inpH, inpW, resH, resW)  
+    return preds, preds_tf, maxval
+
+# save .json(Proportion_people)  and .npy(hms) files.
+def save_myjson(im_name,Proportion_people,hms):
+    '''
+        im_name : string
+        Proportion_people : List = n*tuple(width, height)
+        hms : torch.tensor
+    '''
+    print(im_name)
+   # print(Proportion_people)
+    print(json.dumps(Proportion_people,sort_keys=True, indent=4))
+    np_hms = hms.numpy()
+    np.save("out_npy/" + im_name.replace('.jpg', '') + ".npy",np_hms)
+    with open("out_npy/" + im_name.replace('.jpg', '') + ".json", "w", encoding='utf-8') as file:
+        file.write(json.dumps(Proportion_people, indent=4))
+    return
